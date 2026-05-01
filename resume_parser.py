@@ -18,7 +18,6 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 class ModelCache:
-    # caching for model to avoid reloading
     _instance = None
     _models = {}
 
@@ -56,30 +55,35 @@ class ResumeParser:
         self.section_headers = {
             'education': ['education', 'academic', 'qualification', 'degree', 'university', 'college'],
             'experience': ['experience', 'employment', 'work history', 'professional experience',
-                          'work experience', 'career history', 'professional background'],
+                          'work experience', 'career history', 'professional background', 'internships',
+                          'experience & courses', 'teaching'],
             'skills': ['skills', 'technical skills', 'competencies', 'expertise', 'technologies',
-                      'technical competencies', 'core competencies', 'tech stack'],
-            'projects': ['projects', 'project experience', 'personal projects', 'key projects'],
-            'certifications': ['certifications', 'certificates', 'licenses', 'credentials'],
+                      'technical competencies', 'core competencies', 'tech stack', 'core skills'],
+            'soft_skills': ['soft skills', 'interpersonal skills', 'personal skills'],
+            'projects': ['projects', 'project experience', 'personal projects', 'key projects',
+                        'project involvement'],
+            'certifications': ['certifications', 'certificates', 'licenses', 'credentials', 'courses'],
             'summary': ['summary', 'profile', 'objective', 'about', 'introduction', 'professional summary'],
-            'awards': ['awards', 'honors', 'achievements', 'recognition', 'accomplishments'],
+            'awards': ['awards', 'honors', 'achievements', 'recognition', 'accomplishments', 'honors & awards'],
             'publications': ['publications', 'research', 'papers', 'articles'],
-            'languages': ['languages', 'language proficiency', 'spoken languages']
+            'languages': ['languages', 'language proficiency', 'spoken languages'],
+            'volunteering': ['volunteering', 'volunteer', 'extracurricular', 'community',
+                           'extracurricular activities'],
+            'interests': ['interests', 'hobbies'],
         }
 
-        # Entities to exclude from NER output
         self.excluded_entity_types = {
-            'Email Address',  # Already in contact_info
-            'Phone',          # Already in contact_info
-            'Degree',         # Already in education section
-            'Name'            # Already in contact_info
+            'Email Address',
+            'Phone',
+            'Degree',
+            'Name',
+            'Companies worked at'
         }
 
-        # Date patterns (excluding phone numbers)
         self.date_patterns = [
             r'\b(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\.?\s+\d{4}\b',
             r'\b\d{1,2}/\d{4}\b',
-            r'\b(19|20)\d{2}\b',  # Only 1900-2099 to avoid phone numbers
+            r'\b(19|20)\d{2}\b',
             r'\b(Present|Current|Now|Ongoing)\b'
         ]
 
@@ -112,7 +116,6 @@ class ResumeParser:
             raise ValueError(f"Failed to extract text from DOCX: {str(e)}")
 
     def clean_and_preprocess(self, text: str) -> Dict:
-        # Clean and preprocess text with better tokenization
         if not text:
             return {
                 'original_text': '',
@@ -146,57 +149,149 @@ class ResumeParser:
             }
 
     def normalize_phone(self, phone: str) -> Optional[str]:
-        # Normalize phone number to international format
         try:
-            parsed = phonenumbers.parse(phone, "US")  # Default to US
+            parsed = phonenumbers.parse(phone, "US")
             if phonenumbers.is_valid_number(parsed):
                 return phonenumbers.format_number(parsed, phonenumbers.PhoneNumberFormat.INTERNATIONAL)
         except:
             pass
-        return phone  # Return original if can't parse
+        return phone
+
+    def extract_location(self, text: str) -> Optional[str]:
+        """Extract location - FIXED to handle locations in education section"""
+        # Pattern 1: "City, State" or "City, ST" on its own line
+        location_pattern = r'\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*),\s*([A-Z][a-z]+|[A-Z]{2})\b'
+
+        lines = text.split('\n')
+        for i, line in enumerate(lines[:20]):  # Check first 20 lines
+            # Skip lines that are clearly not locations
+            if any(marker in line.lower() for marker in ['email', 'phone', '@', 'http', 'linkedin', 'github', 'university', 'bachelor', 'gpa']):
+                continue
+
+            match = re.search(location_pattern, line)
+            if match:
+                if not re.search(r'\d{3,}', line):  # No long numbers
+                    location = match.group(0)
+                    # Verify it's not part of a longer phrase
+                    if len(line.strip()) < 50:
+                        return location
+
+        # Pattern 2: Location in education section (e.g., "Nile University Sheikh Zayed, Giza")
+        edu_location_pattern = r'(?:University|College|Institute)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*,\s*[A-Z][a-z]+)'
+        match = re.search(edu_location_pattern, text)
+        if match:
+            return match.group(1)
+
+        return None
+
+    def extract_website(self, text: str) -> Optional[str]:
+        """Extract personal website - FIXED to capture full GitHub Pages URLs"""
+        # Pattern for GitHub Pages and other personal websites
+        website_patterns = [
+            # GitHub Pages with subdomain: username.github.io/repo
+            r'(?:https?://)?([a-zA-Z0-9-]+\.github\.io/[^\s]+)',
+            # Standard personal websites
+            r'(?:https?://)?(?:www\.)?([a-zA-Z0-9-]+\.(?:com|net|org|io|dev|me))(?:/[^\s]*)?'
+        ]
+
+        lines = text.split('\n')[:15]
+        for line in lines:
+            # Skip if it's LinkedIn, GitHub (non-Pages), or contains @
+            if 'linkedin.com' in line.lower() or re.match(r'.*github\.com/[^/]+$', line.lower()) or '@' in line:
+                continue
+
+            for pattern in website_patterns:
+                match = re.search(pattern, line, re.IGNORECASE)
+                if match:
+                    url = match.group(0)
+                    # Exclude email domains
+                    if any(domain in url.lower() for domain in ['gmail.com', 'yahoo.com', 'hotmail.com']):
+                        continue
+                    # Ensure it has https
+                    if not url.startswith('http'):
+                        url = 'https://' + url
+                    return url
+
+        return None
 
     def extract_name(self, text: str) -> Optional[str]:
+        """Extract person name - FIXED"""
         try:
-            # Split into lines first to avoid grabbing multiple lines
             lines = [line.strip() for line in text.split('\n') if line.strip()]
 
-            # Try NER on first few lines only
-            first_lines = '\n'.join(lines[:3])
+            location_keywords = ['giza', 'cairo', 'egypt', 'sheikh', 'zayed', 'nasr city']
+
+            for i, line in enumerate(lines[:5]):
+                if any(marker in line.lower() for marker in ['email', 'phone', '@', 'http', 'linkedin', 'github'] + location_keywords):
+                    continue
+
+                words = line.split()
+                if 2 <= len(words) <= 4:
+                    if all(w[0].isupper() for w in words if w and w[0].isalpha()):
+                        if not re.search(r'[@\d:;]', line) and len(line) < 50:
+                            return line
+
+            first_lines = '\n'.join(lines[:5])
             doc = self.nlp(first_lines)
 
-            # Look for PERSON entities
             for ent in doc.ents:
                 if ent.label_ == "PERSON":
                     name = ent.text.strip()
-                    # Validate it's actually a name
+                    if any(loc in name.lower() for loc in location_keywords):
+                        continue
                     if 2 <= len(name.split()) <= 4 and len(name) < 50:
-                        # Make sure it doesn't contain newlines or email-like strings
                         if '\n' not in name and '@' not in name and ':' not in name:
                             return name
-
-            # Check first few lines with better validation
-            for line in lines[:5]:
-                # Skip lines with contact info markers
-                if any(marker in line.lower() for marker in ['email', 'phone', '@', 'http', 'linkedin']):
-                    continue
-
-                # Check if it looks like a name
-                words = line.split()
-                if 2 <= len(words) <= 4:
-                    # All words should start with capital letters
-                    if all(w[0].isupper() for w in words if w and w[0].isalpha()):
-                        # No digits, no special chars except spaces and hyphens
-                        if not re.search(r'[@\d:;]', line):
-                            return line
-
-            # Last resort: just return first line if it's reasonable
-            if lines and len(lines[0]) < 50 and not re.search(r'[@:]', lines[0]):
-                return lines[0]
 
             return None
         except Exception as e:
             logger.error(f"Error extracting name: {e}")
             return None
+
+    def extract_summary(self, text: str) -> Optional[str]:
+        """Extract professional summary - FIXED to extract complete paragraphs"""
+        lines = text.split('\n')
+
+        summary_keywords = ['summary', 'profile', 'objective', 'about', 'professional summary']
+
+        for i, line in enumerate(lines):
+            line_lower = line.lower().strip()
+
+            # Check if this line is a summary header
+            if any(keyword == line_lower or line_lower.startswith(keyword + ':') for keyword in summary_keywords):
+                # Extract all non-empty lines until we hit another section header
+                summary_lines = []
+                for j in range(i + 1, len(lines)):
+                    next_line = lines[j].strip()
+
+                    if not next_line:
+                        continue
+
+                    # Stop if we hit another major section header
+                    next_lower = next_line.lower()
+                    is_section_header = False
+                    for section_keywords in self.section_headers.values():
+                        if any(kw == next_lower or next_lower.startswith(kw + ':') for kw in section_keywords):
+                            is_section_header = True
+                            break
+
+                    if is_section_header:
+                        break
+
+                    # Stop if line looks like a header (all caps, short, or ends with colon)
+                    if (len(next_line) < 40 and next_line.isupper()) or next_line.endswith(':'):
+                        break
+
+                    summary_lines.append(next_line)
+
+                    # Collect up to 10 lines or until natural paragraph break
+                    if len(summary_lines) >= 10:
+                        break
+
+                if summary_lines:
+                    return ' '.join(summary_lines)
+
+        return None
 
     def extract_contact_info(self, text: str) -> Dict:
         contact_info = {}
@@ -204,14 +299,19 @@ class ResumeParser:
         # Email
         email_pattern = r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b'
         emails = re.findall(email_pattern, text)
-        contact_info['email'] = emails[0] if emails else None
+        if emails:
+            contact_info['email'] = ' | '.join(emails) if len(emails) > 1 else emails[0]
+        else:
+            contact_info['email'] = None
         contact_info['email_confidence'] = 1.0 if emails else 0.0
 
-        # Phone
+        # Phone - preserve original format
         phone_pattern = r'(?:\+?\d{1,3}[-.\s]?)?(?:\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4})'
         phones = re.findall(phone_pattern, text)
         if phones:
-            contact_info['phone'] = self.normalize_phone(phones[0])
+            raw_phone = phones[0]
+            clean_phone = re.sub(r'[()]', '', raw_phone).strip()
+            contact_info['phone'] = clean_phone
             contact_info['phone_confidence'] = 0.9
         else:
             contact_info['phone'] = None
@@ -227,14 +327,19 @@ class ResumeParser:
         github = re.findall(github_pattern, text, re.IGNORECASE)
         contact_info['github'] = github[0] if github else None
 
-        # Name with better extraction
+        # Location - FIXED
+        contact_info['location'] = self.extract_location(text)
+
+        # Website - FIXED
+        contact_info['website'] = self.extract_website(text)
+
+        # Name - FIXED
         contact_info['name'] = self.extract_name(text)
         contact_info['name_confidence'] = 0.8 if contact_info['name'] else 0.0
 
         return contact_info
 
     def extract_dates(self, text: str) -> List[Dict]:
-        # Extract dates and date ranges from text (excluding phone numbers)
         dates = []
         seen_positions = set()
 
@@ -244,11 +349,9 @@ class ResumeParser:
                 date_text = match.group()
                 position = match.start()
 
-                # Skip if this position was already captured
                 if position in seen_positions:
                     continue
 
-                # Validate it's actually a year (not part of phone number)
                 if date_text.isdigit():
                     year = int(date_text)
                     if not (1950 <= year <= 2030):
@@ -263,120 +366,241 @@ class ResumeParser:
         return dates
 
     def extract_gpa(self, text: str) -> Optional[float]:
-        # Extract GPA from education section
+        """Extract GPA - FIXED to handle formats like '3.7/4 GPA'"""
         gpa_patterns = [
             r'GPA[:\s]*(\d+\.\d+)',
             r'Grade[:\s]*(\d+\.\d+)',
-            r'(\d+\.\d+)\s*/\s*4\.0',
-            r'(\d+\.\d+)\s*/\s*5\.0'  # Some universities use 5.0 scale
+            r'(\d+\.\d+)\s*/\s*4\.?0?',  # Fixed: handles "3.7/4 GPA"
+            r'(\d+\.\d+)\s*/\s*5\.?0?'
         ]
         for pattern in gpa_patterns:
             match = re.search(pattern, text, re.IGNORECASE)
             if match:
                 try:
                     gpa = float(match.group(1))
-                    # Validate GPA range
                     if 0 <= gpa <= 5.0:
                         return gpa
                 except:
                     pass
         return None
 
-    def extract_degree_type(self, text: str) -> Optional[str]:
-        degree_patterns = [
-            (r'\b(Ph\.?D\.?|PhD|Doctorate)\b', 'PhD'),
-            (r'\b(M\.?S\.?|M\.?Sc\.?|Master of Science)\b', 'Masters'),
-            (r'\b(M\.?B\.?A\.?|Master of Business)\b', 'MBA'),
-            (r'\b(M\.?A\.?|Master of Arts)\b', 'Masters'),
-            (r'\b(B\.?S\.?|B\.?Sc\.?|Bachelor of Science)\b', 'Bachelors'),
-            (r'\b(B\.?A\.?|Bachelor of Arts)\b', 'Bachelors'),
-            (r'\b(Associate)\b', 'Associate'),
+    def extract_honors(self, text: str) -> Optional[str]:
+        """Extract honors"""
+        honors_patterns = [
+            r'\b(summa cum laude|magna cum laude|cum laude)\b',
+            r'\b(dean\'?s?\s+honor)\b',
+            r'\b(president\'?s?\s+honor)\b',
+            r'\b(excellence\s+scholarship)\b'
         ]
-
-        for pattern, degree_type in degree_patterns:
-            if re.search(pattern, text, re.IGNORECASE):
-                return degree_type
+        for pattern in honors_patterns:
+            match = re.search(pattern, text, re.IGNORECASE)
+            if match:
+                return match.group(0)
         return None
 
+    def split_education_entries(self, education_text: str) -> List[Dict]:
+        """Split multiple education entries"""
+        entries = []
+        degree_pattern = r'((?:B\.?(?:S\.?|A\.?|Eng\.?|Tech\.?)|M\.?(?:S\.?|A\.?|Eng\.?)|Ph\.?D\.?)\s+in\s+[^,\n]+(?:,\s*[^,\(]+(?:\([^\)]+\))?)?(?:,\s*GPA[^,\n]+)?)'
+
+        matches = list(re.finditer(degree_pattern, education_text, re.IGNORECASE))
+
+        if len(matches) > 1:
+            for match in matches:
+                entry_text = match.group(0).strip()
+                entry = {'text': entry_text}
+
+                dates = self.extract_dates(entry_text)
+                if dates:
+                    entry['dates'] = [d['text'] for d in dates]
+
+                gpa = self.extract_gpa(entry_text)
+                if gpa:
+                    entry['gpa'] = gpa
+
+                honors = self.extract_honors(entry_text)
+                if honors:
+                    entry['honors'] = honors
+
+                entries.append(entry)
+        else:
+            entry = {'text': education_text.strip()}
+            dates = self.extract_dates(education_text)
+            if dates:
+                entry['dates'] = [d['text'] for d in dates]
+
+            gpa = self.extract_gpa(education_text)
+            if gpa:
+                entry['gpa'] = gpa
+
+            honors = self.extract_honors(education_text)
+            if honors:
+                entry['honors'] = honors
+
+            entries.append(entry)
+
+        return entries
+
     def parse_skills(self, skills_text: str) -> List[str]:
-        # Parse skills section into individual skills
-        # Common separators: comma, semicolon, pipe, bullet points
+        """Parse skills section into individual skills"""
         separators = r'[,;|•\n]'
         skills = re.split(separators, skills_text)
 
-        # Clean and filter skills
         parsed_skills = []
         for skill in skills:
             skill = skill.strip()
-            # Remove bullet points and numbers
             skill = re.sub(r'^[\-\*\d\.]+\s*', '', skill).strip()
-            # Skip empty or very long entries
-            if skill and 2 <= len(skill) <= 50:
+            skill = re.sub(r'\s+', ' ', skill).strip()
+
+            if not skill:
+                continue
+
+            if 1 <= len(skill) <= 100:
                 parsed_skills.append(skill)
 
         return parsed_skills
 
+    def extract_company_from_title(self, title_text: str) -> Optional[str]:
+        """Extract company name from job title"""
+        # Pattern 1: "at Company"
+        at_pattern = r'\s+at\s+([A-Z][A-Za-z0-9\s&\-\.]+?)(?:\s*\(|\s*$|,|\s+\d{4}|\s+â€")'
+        match = re.search(at_pattern, title_text)
+        if match:
+            company = match.group(1).strip()
+            company = re.sub(r'[,\.\-]+$', '', company).strip()
+            return company
+
+        # Pattern 2: "— Company"
+        dash_pattern = r'â€"\s+([A-Z][A-Za-z0-9\s&\-\.]+?)(?:\s*\(|\s*$|,|\s+\d{4})'
+        match = re.search(dash_pattern, title_text)
+        if match:
+            company = match.group(1).strip()
+            company = re.sub(r'[,\.\-]+$', '', company).strip()
+            return company
+
+        # Pattern 3: Extract from parentheses at end (e.g., "(Company Name)")
+        paren_pattern = r'\(([^)]+)\)\s*$'
+        match = re.search(paren_pattern, title_text)
+        if match:
+            company = match.group(1).strip()
+            if len(company) > 3 and not company.isdigit():
+                return company
+
+        return None
+
+    def extract_responsibilities_from_text(self, text: str) -> List[str]:
+        """Extract individual responsibilities from experience text"""
+        responsibilities = []
+        lines = text.split('\n')
+
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+
+            # Skip if it looks like a job title with dates
+            if re.search(r'\d{4}', line) and re.search(r'(at|@|â€")\s+[A-Z]', line):
+                continue
+
+            # Remove bullet points
+            line = re.sub(r'^[\-\*•o]\s*', '', line).strip()
+
+            # Check if it starts with an action verb or is descriptive
+            action_verbs = r'^(Developed|Designed|Built|Created|Implemented|Managed|Led|Collaborated|Optimized|Reduced|Increased|Migrated|Architected|Established|Conducted|Presented|Published|Deployed|Mentored|Facilitated|Analyzed|Resolved|Drove|Defined|Integrated|Improved|Grew|Automated|Configured|Monitored|Deliver|Coordinate|Facilitate|worked|Assist|Support|Contribut|Focus|Gain|Complet|Acquired|Helped|Processed)'
+
+            if re.match(action_verbs, line, re.IGNORECASE) or len(line) > 30:
+                responsibilities.append(line)
+
+        return responsibilities
+
+    def group_experience_entries(self, experience_items: List[Dict]) -> List[Dict]:
+        """Better grouping of experience entries"""
+        grouped = []
+        current_job = None
+
+        for item in experience_items:
+            text = item['text'].strip()
+            has_dates = 'dates' in item and item['dates']
+
+            # Check if this is a job title
+            is_job_title = (
+                has_dates or
+                re.search(r'\bat\b.*\(?\d{4}', text, re.IGNORECASE) or
+                re.search(r'â€".*\d{4}', text, re.IGNORECASE) or
+                re.search(r'(engineer|developer|manager|analyst|scientist|designer|lead|senior|principal|architect|director|intern|assistant|mentor|coordinator|instructor|teacher)\s+(at|â€")\s+\w+', text, re.IGNORECASE) or
+                re.search(r'(intern|assistant|instructor|teacher|mentor|coordinator)', text, re.IGNORECASE)
+            )
+
+            # Check if it's a responsibility
+            is_responsibility = re.match(r'^(Developed|Designed|Built|Created|Implemented|Managed|Led|Collaborated|Optimized|Reduced|Increased|Deliver|Coordinate|Facilitate|worked|Assist|helped|Processed)', text, re.IGNORECASE)
+
+            if is_job_title and not is_responsibility:
+                if current_job:
+                    grouped.append(current_job)
+
+                company = self.extract_company_from_title(text)
+
+                current_job = {
+                    'title': text,
+                    'dates': item.get('dates', []),
+                    'responsibilities': [],
+                    'company': company
+                }
+            elif current_job:
+                responsibilities = self.extract_responsibilities_from_text(text)
+                current_job['responsibilities'].extend(responsibilities)
+            elif not current_job and not is_job_title:
+                grouped.append({
+                    'title': text,
+                    'dates': item.get('dates', []),
+                    'responsibilities': [],
+                    'company': None
+                })
+
+        if current_job:
+            grouped.append(current_job)
+
+        return grouped
+
     def validate_entity(self, label: str, text: str) -> bool:
         text = text.strip()
 
-        # Exclude redundant entity types
         if label in self.excluded_entity_types:
             return False
 
-        # Filter out nonsense entities
         if len(text) < 2 or len(text) > 100:
             return False
 
-        # Check for specific label validations
-        if label == "Companies worked at":
-            # Should not contain too many special chars or newlines
-            if '\n' in text or text.count('-') > 2:
-                return False
-            # Should not be a full sentence describing work
-            if len(text.split()) > 8:
-                return False
-            # Should not contain common action verbs (indicates it's a job description)
-            action_verbs = ['developed', 'designed', 'built', 'created', 'managed', 'led', 'worked']
-            if any(verb in text.lower() for verb in action_verbs):
-                return False
-            return True
-
-        elif label == "Skills":
-            # Should not be a full sentence
+        if label == "Skills":
             if len(text.split()) > 15:
                 return False
-            # Should not contain verbs (indicates description not skill)
             if re.search(r'\b(developed|designed|built|created|worked|using|with)\b', text.lower()):
                 return False
             return True
 
         elif label == "Designation":
-            # Should be reasonable length job title
             if len(text.split()) > 10:
                 return False
-            # Should not start with action verbs
             if re.match(r'^(developed|designed|built|created|managed)', text, re.IGNORECASE):
                 return False
             return True
 
         elif label == "College Name":
-            # Should be reasonable length
             if len(text.split()) > 10:
                 return False
             return True
 
         elif label == "Graduation Year":
-            # Should be a valid year
             year_match = re.search(r'(19|20)\d{2}', text)
             if year_match:
                 year = int(year_match.group())
                 return 1950 <= year <= 2030
             return False
 
-        # Default: accept the entity
         return True
 
     def extract_entities_with_ner(self, text: str, confidence_threshold: float = 0.45) -> Dict:
+        """Keep original NER function intact"""
         if not text:
             return {}
 
@@ -422,26 +646,6 @@ class ResumeParser:
                                 'text': ent_text,
                                 'confidence': float(current_entity['avg_confidence'])
                             })
-                        current_entity = {
-                            'label': label[2:],
-                            'start': start_off,
-                            'end': end_off,
-                            'confidences': [confidence],
-                            'avg_confidence': confidence
-                        }
-                    elif label.startswith("I-") and current_entity:
-                        if label[2:] == current_entity['label']:
-                            current_entity['end'] = end_off
-                            current_entity['confidences'].append(confidence)
-                            current_entity['avg_confidence'] = float(np.mean(current_entity['confidences']))
-                    else:
-                        if current_entity and current_entity['avg_confidence'] >= confidence_threshold:
-                            ent_text = chunk[current_entity['start']: current_entity['end']]
-                            all_entities.append({
-                                'label': current_entity['label'],
-                                'text': ent_text,
-                                'confidence': float(current_entity['avg_confidence'])
-                            })
                         current_entity = None
 
                 if current_entity and current_entity['avg_confidence'] >= confidence_threshold:
@@ -452,14 +656,12 @@ class ResumeParser:
                         'confidence': float(current_entity['avg_confidence'])
                     })
 
-            # Deduplicate and group entities with validation
             dedup = {}
             for ent in all_entities:
                 key = (ent['label'], ent['text'].strip())
                 if not key[1]:
                     continue
 
-                # Validate entity before adding
                 if not self.validate_entity(key[0], key[1]):
                     continue
 
@@ -479,7 +681,6 @@ class ResumeParser:
             return {}
 
     def fuzzy_match_section(self, line: str, threshold: int = 80) -> Optional[str]:
-        # Fuzzy match section headers for better detection
         line_lower = line.lower().strip()
 
         for section_type, keywords in self.section_headers.items():
@@ -489,77 +690,30 @@ class ResumeParser:
                     return section_type
         return None
 
-    def group_experience_entries(self, experience_items: List[Dict]) -> List[Dict]:
-        grouped = []
-        current_job = None
-
-        for item in experience_items:
-            text = item['text']
-            has_dates = 'dates' in item and item['dates']
-
-            # Check if this looks like a job title line (has dates or follows pattern)
-            is_job_title = (
-                has_dates or
-                re.search(r'\bat\b|\bwith\b|\b@\b', text, re.IGNORECASE) or
-                (len(text.split()) <= 15 and not text.startswith(('-', '•', '*')))
-            )
-
-            if is_job_title and (has_dates or current_job is None):
-                # Start a new job entry
-                if current_job:
-                    grouped.append(current_job)
-
-                current_job = {
-                    'title': text,
-                    'dates': item.get('dates', []),
-                    'responsibilities': []
-                }
-            elif current_job:
-                # Add as bullet point to current job
-                current_job['responsibilities'].append(text)
-            else:
-                # Create standalone entry
-                grouped.append({
-                    'title': text,
-                    'dates': item.get('dates', []),
-                    'responsibilities': []
-                })
-
-        # Don't forget the last job
-        if current_job:
-            grouped.append(current_job)
-
-        return grouped
-
     def segment_sections(self, text: str, contact_info: Dict) -> Dict:
         lines = text.split('\n')
         sections = {}
         current_section = 'other'
         current_content = []
 
-        # Build set of values to skip (contact info and common prefixes)
         skip_values = set()
         for key, value in contact_info.items():
             if value and isinstance(value, str):
-                skip_values.add(value)
-                # Also add variations without "Email:" or "Phone:" prefixes
+                skip_values.add(value.lower())
                 if ':' in value:
-                    skip_values.add(value.split(':', 1)[1].strip())
+                    skip_values.add(value.split(':', 1)[1].strip().lower())
 
         for line in lines:
             stripped = line.strip()
             if not stripped:
                 continue
 
-            # Skip contact info lines
-            if any(skip_val in line for skip_val in skip_values):
+            if any(skip_val in stripped.lower() for skip_val in skip_values if len(skip_val) > 2):
                 continue
 
-            # Skip lines that are just "Email:" or "Phone:" labels
             if re.match(r'^(email|phone|linkedin|github):\s*$', stripped, re.IGNORECASE):
                 continue
 
-            # Try exact match first
             section_found = False
             for section_type, keywords in self.section_headers.items():
                 pattern = r'^\s*(?:' + '|'.join(re.escape(k) for k in keywords) + r')\s*:?\s*$'
@@ -571,7 +725,6 @@ class ResumeParser:
                     section_found = True
                     break
 
-            # Try fuzzy match if exact failed
             if not section_found and len(stripped.split()) <= 3:
                 fuzzy_section = self.fuzzy_match_section(stripped)
                 if fuzzy_section:
@@ -587,38 +740,56 @@ class ResumeParser:
         if current_content:
             sections.setdefault(current_section, []).append('\n'.join(current_content).strip())
 
-        # Structure sections better with enhanced parsing
+        # Structure sections
         structured_sections = {}
         for sec, contents in sections.items():
             structured_sections[sec] = []
             for block in contents:
-                # Preserve bullet structure
-                items = [i.strip() for i in re.split(r'\n(?=[•\-\*]|\d+\.)', block) if i.strip()]
-                for item in items:
-                    clean_item = re.sub(r'^[•\-\*]\s*', '', item).strip()
-                    if clean_item:
-                        # Extract dates if present
-                        dates = self.extract_dates(clean_item)
-                        entry = {'text': clean_item}
-                        if dates:
-                            entry['dates'] = [d['text'] for d in dates]
-
-                        # Enhanced education parsing - extract GPA only
-                        if sec == 'education':
-                            gpa = self.extract_gpa(clean_item)
-                            if gpa:
-                                entry['gpa'] = gpa
-
-                        # Enhanced skills parsing
-                        if sec == 'skills':
-                            # Parse individual skills from text
+                if sec == 'education':
+                    education_entries = self.split_education_entries(block)
+                    structured_sections[sec].extend(education_entries)
+                elif sec == 'experience':
+                    items = [line.strip() for line in block.split('\n') if line.strip()]
+                    for item in items:
+                        clean_item = re.sub(r'^[•\-\*o]\s*', '', item).strip()
+                        if clean_item:
+                            dates = self.extract_dates(clean_item)
+                            entry = {'text': clean_item}
+                            if dates:
+                                entry['dates'] = [d['text'] for d in dates]
+                            structured_sections[sec].append(entry)
+                elif sec in ['skills', 'soft_skills']:
+                    items = [i.strip() for i in re.split(r'\n(?=[•\-\*o]|\d+\.)', block) if i.strip()]
+                    for item in items:
+                        clean_item = re.sub(r'^[•\-\*o]\s*', '', item).strip()
+                        if clean_item:
+                            entry = {'text': clean_item}
                             individual_skills = self.parse_skills(clean_item)
                             if individual_skills:
                                 entry['parsed_skills'] = individual_skills
+                            structured_sections[sec].append(entry)
+                elif sec in ['volunteering', 'interests', 'publications', 'awards', 'certifications', 'projects']:
+                    items = [i.strip() for i in re.split(r'\n(?=[•\-\*o]|\d+\.)', block) if i.strip()]
+                    for item in items:
+                        clean_item = re.sub(r'^[•\-\*o]\s*', '', item).strip()
+                        if clean_item:
+                            dates = self.extract_dates(clean_item)
+                            entry = {'text': clean_item}
+                            if dates:
+                                entry['dates'] = [d['text'] for d in dates]
+                            structured_sections[sec].append(entry)
+                else:
+                    items = [i.strip() for i in re.split(r'\n(?=[•\-\*o]|\d+\.)', block) if i.strip()]
+                    for item in items:
+                        clean_item = re.sub(r'^[•\-\*o]\s*', '', item).strip()
+                        if clean_item:
+                            dates = self.extract_dates(clean_item)
+                            entry = {'text': clean_item}
+                            if dates:
+                                entry['dates'] = [d['text'] for d in dates]
+                            structured_sections[sec].append(entry)
 
-                        structured_sections[sec].append(entry)
-
-        # Group experience entries better
+        # Group experience entries
         if 'experience' in structured_sections:
             structured_sections['experience'] = self.group_experience_entries(
                 structured_sections['experience']
@@ -627,7 +798,6 @@ class ResumeParser:
         return structured_sections
 
     def calculate_years_of_experience(self, sections: Dict) -> float:
-        # Calculate total years of experience from experience section
         if 'experience' not in sections:
             return 0.0
 
@@ -635,12 +805,10 @@ class ResumeParser:
         current_year = datetime.now().year
 
         for entry in sections['experience']:
-            # Handle both old format and new grouped format
             dates = entry.get('dates', [])
 
             if len(dates) >= 2:
                 try:
-                    # Parse start and end dates
                     start_match = re.search(r'(19|20)\d{2}', dates[0])
                     if not start_match:
                         continue
@@ -663,55 +831,52 @@ class ResumeParser:
 
     def generate_summary_stats(self, structured_resume: Dict) -> Dict:
         stats = {}
-
         sections = structured_resume.get('sections', {})
 
-        # Count items in each section
-        stats['education_count'] = len(sections.get('education', []))
-        stats['experience_count'] = len(sections.get('experience', []))
-        stats['certifications_count'] = len(sections.get('certifications', []))
-        stats['projects_count'] = len(sections.get('projects', []))
+        #stats['education_count'] = len(sections.get('education', []))
+        #stats['experience_count'] = len(sections.get('experience', []))
+        #stats['certifications_count'] = len(sections.get('certifications', []))
+        #stats['projects_count'] = len(sections.get('projects', []))
+        #stats['companies_worked_for'] = stats['experience_count']
 
-        # Skills count
-        skills_section = sections.get('skills', [])
-        if skills_section:
-            total_skills = 0
-            for skill_entry in skills_section:
-                if 'parsed_skills' in skill_entry:
-                    total_skills += len(skill_entry['parsed_skills'])
-            stats['skills_count'] = total_skills
-        else:
-            stats['skills_count'] = 0
+        #skills_section = sections.get('skills', [])
+        #if skills_section:
+         #   total_skills = 0
+          #  for skill_entry in skills_section:
+          #      if 'parsed_skills' in skill_entry:
+           #         total_skills += len(skill_entry['parsed_skills'])
+            #stats['skills_count'] = total_skills
+        #else:
+            #stats['skills_count'] = 0
 
-        # Check completeness
-        stats['has_email'] = structured_resume['contact_info'].get('email') is not None
-        stats['has_phone'] = structured_resume['contact_info'].get('phone') is not None
-        stats['has_linkedin'] = structured_resume['contact_info'].get('linkedin') is not None
-        stats['has_github'] = structured_resume['contact_info'].get('github') is not None
+        #stats['has_email'] = structured_resume['contact_info'].get('email') is not None
+        #stats['has_phone'] = structured_resume['contact_info'].get('phone') is not None
+        #stats['has_linkedin'] = structured_resume['contact_info'].get('linkedin') is not None
+        #stats['has_github'] = structured_resume['contact_info'].get('github') is not None
 
-        # Completeness score (0-100)
-        completeness_factors = [
-            stats['has_email'],
-            stats['has_phone'],
-            stats['education_count'] > 0,
-            stats['experience_count'] > 0,
-            stats['skills_count'] > 0,
-            structured_resume['contact_info'].get('name') is not None
-        ]
-        stats['completeness_score'] = round((sum(completeness_factors) / len(completeness_factors)) * 100, 1)
+        #stats['years_of_experience'] = self.calculate_years_of_experience(sections)
+
+        #completeness_factors = [
+         #   stats['has_email'],
+          #  stats['has_phone'],
+           # stats['education_count'] > 0,
+            #stats['experience_count'] > 0,
+            #stats['skills_count'] > 0,
+            #structured_resume['contact_info'].get('name') is not None
+        #]
+        #stats['completeness_score'] = round((sum(completeness_factors) / len(completeness_factors)) * 100, 1)
 
         return stats
-    # Full pipeline
-    def parse_resume(self, file_path: str, confidence_threshold: float = 0.45) -> Dict:
-        try:
-            file_path = Path(file_path)
 
+    def parse_resume(self, file_path: str, confidence_threshold: float = 0.45) -> Dict:
+        file_path = Path(file_path)
+
+        try:
             if not file_path.exists():
                 raise FileNotFoundError(f"File not found: {file_path}")
 
             logger.info(f"Parsing resume: {file_path.name}")
 
-            # Extract text based on file type
             if file_path.suffix.lower() == '.pdf':
                 raw_text = self.extract_text_from_pdf(file_path)
             elif file_path.suffix.lower() in ['.docx', '.doc']:
@@ -724,52 +889,65 @@ class ResumeParser:
             if not raw_text.strip():
                 raise ValueError("No text could be extracted from the file")
 
-            # Process resume
             preprocessed = self.clean_and_preprocess(raw_text)
             contact_info = self.extract_contact_info(raw_text)
             entities = self.extract_entities_with_ner(raw_text, confidence_threshold)
             sections = self.segment_sections(raw_text, contact_info)
-            years_exp = self.calculate_years_of_experience(sections)
+
+            # Extract summary at top level - FIXED
+            summary = self.extract_summary(raw_text)
 
             structured_resume = {
                 'file_name': file_path.name,
-                'contact_info': contact_info,
+                #'contact_info': contact_info,
+                'summary': summary,
                 'sections': sections,
-                'entities': entities,
-                'metadata': {
-                    'total_tokens': len(preprocessed['processed_tokens']),
-                    'years_of_experience': years_exp,
-                    'processed': True,
-                    'timestamp': datetime.now().isoformat()
-                }
+                'processed': True,
+                #'metadata': {
+                  #  'total_tokens': len(preprocessed['processed_tokens']),
+                 #   'timestamp': datetime.now().isoformat()
+                #}
             }
+            
+            # ---- REMOVE DATES FROM OUTPUT ----
+            for section, items in structured_resume['sections'].items():
+              for item in items:
+                if 'dates' in item:
+                  del item['dates']
+            # Also remove dates from experience substructure (grouped jobs)
+            if 'experience' in structured_resume['sections']:
+              for job in structured_resume['sections']['experience']:
+                if 'dates' in job:
+                  del job['dates']
 
-            # Add summary statistics
-            structured_resume['summary_stats'] = self.generate_summary_stats(structured_resume)
+            # ---- REMOVE COMPANY FROM OUTPUT ----
+            if 'experience' in structured_resume['sections']:
+              for job in structured_resume['sections']['experience']:
+                if 'company' in job:
+                  del job['company']
+
+            # ---- REMOVE SUMMARY + OTHER SECTIONS FROM OUTPUT ----
+            if 'summary' in structured_resume['sections']:
+              del structured_resume['sections']['summary']
+            if 'other' in structured_resume['sections']:
+              del structured_resume['sections']['other']
+
+            # ---- REMOVE LANGUAGES + INTERESTS SECTIONS FROM OUTPUT ----
+            if 'languages' in structured_resume['sections']:
+              del structured_resume['sections']['languages']
+
+            if 'interests' in structured_resume['sections']:
+              del structured_resume['sections']['interests']
+
+            #structured_resume['summary_stats'] = self.generate_summary_stats(structured_resume)
 
             logger.info(f"Successfully parsed resume: {file_path.name}")
             return structured_resume
 
         except Exception as e:
-            logger.error(f"Error parsing resume: {e}")
+            logger.error(f"Error parsing resume {file_path.name}: {e}", exc_info=True)
             return {
-                'file_name': str(file_path),
+                'file_name': file_path.name,
                 'error': str(e),
                 'processed': False
             }
-
-def main():
-    parser = ResumeParser()
-
-    file_path = "resume1.pdf"
-
-    try:
-        structured_resume = parser.parse_resume(file_path)
-        print(json.dumps(structured_resume, indent=2, ensure_ascii=False))
-        return structured_resume
-    except Exception as e:
-        logger.error(f"Failed to parse resume: {e}")
-        return None
-
-if __name__ == "__main__":
-    result = main()
